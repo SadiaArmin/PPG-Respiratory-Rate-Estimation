@@ -13,8 +13,8 @@ This project estimates respiratory rate (RR) from Photoplethysmography (PPG) sig
 - Hybrid spectral product with Gaussian weighting
 
 ## 📊 Results
-- Mean Absolute Error (MAE): ~0.X BPM
-- Accuracy (<1 BPM): XX%
+- Mean Absolute Error (MAE): 0.88 BPM
+- Accuracy (<1 BPM): 77.4%
 - Strong correlation with reference respiration
 
 ## 🛠 Tools Used
