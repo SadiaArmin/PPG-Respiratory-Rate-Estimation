@@ -1,0 +1,242 @@
+clc; clear all; close all;
+
+%% ===============================
+% 1. LOAD DATA & INITIALIZE
+%% ===============================
+load('bidmc_data.mat') 
+fs = 125;                     
+numPatients = length(data);
+minRR_bpm = 6; maxRR_bpm = 25; 
+resp_band = [minRR_bpm/60, maxRR_bpm/60]; 
+
+results = zeros(numPatients,2); 
+all_envelopes = cell(numPatients, 1);
+dom_freq_list = zeros(numPatients, 2); 
+
+%% ===============================
+% 2. MAIN PROCESSING LOOP
+%% ===============================
+fprintf('Processing Patients...\n');
+for k = 1:numPatients
+    % Extract signals
+    signal = double(data(k).ppg.v(:));
+    breath_locs = double(data(k).ref.breaths.ann1(:));
+    t = (0:length(signal)-1)'/fs;
+    duration_min = length(signal)/fs/60;
+    rr_reference = length(breath_locs)/duration_min; 
+
+    % --- PREPROCESSING ---
+    [b_hp, a_hp] = butter(2, [0.5, 8]/(fs/2), 'bandpass');
+    filt_sig = filtfilt(b_hp, a_hp, signal);
+
+    % --- FUSED HILBERT ENVELOPE (AM + BW) ---
+    env_hilbert = abs(hilbert(filt_sig));
+    env_am = movmean(env_hilbert, round(fs*1.5)); 
+    env_am_norm = (env_am - mean(env_am)) / std(env_am);
+    
+    [b_bw, a_bw] = butter(2, 0.6/(fs/2), 'low');
+    env_bw = filtfilt(b_bw, a_bw, signal);
+    env_bw_norm = (env_bw - mean(env_bw)) / std(env_bw);
+    
+    env_fused = (env_am_norm + env_bw_norm) / 2;
+    [b_res, a_res] = butter(2, resp_band/(fs/2), 'bandpass');
+    env = filtfilt(b_res, a_res, env_fused);
+    all_envelopes{k} = env;
+    
+    % ---  BW DOMINANT FREQUENCY ---
+    N_t3 = 2^nextpow2(length(env_bw)*2);
+    Y_t3 = abs(fft(detrend(env_bw).*hann(length(env_bw)), N_t3));
+    f_t3 = (0:N_t3-1)'*(fs/N_t3);
+    idx_t3 = find(f_t3 >= 0.1 & f_t3 <= 0.6);
+    [~, max_idx_t3] = max(Y_t3(idx_t3));
+    dom_freq_list(k, :) = [f_t3(idx_t3(max_idx_t3)), f_t3(idx_t3(max_idx_t3))*60];
+
+    results(k,:) = [k, rr_reference];
+
+    % --- VISUALIZATION: PATIENT 1 ENVELOPE OVERLAY ---
+    if k == 1
+        figure('Name', 'Patient 1: Fused Hilbert Analysis');
+        plot(t, filt_sig, 'Color', [0.7 0.9 0.7]); hold on; 
+        env_plot = env - mean(env);
+        env_plot = (env_plot / (max(env_plot) - min(env_plot))) * (max(filt_sig) - min(filt_sig));
+        env_plot = env_plot + mean(filt_sig);
+        plot(t, env_plot, 'r', 'LineWidth', 2);
+        title('Fused Respiratory Envelope on Filtered PPG (Zoomed)');
+        legend('PPG Heartbeats', 'Fused Respiratory Envelope');
+        xlabel('Time (s)'); xlim([0 30]); grid on;
+    end
+end
+
+%% ================================================================
+% 3. HYBRID EMD + SPECTRAL PRODUCT 
+% ================================================================
+rr_emd_spectral = zeros(numPatients, 1);
+for k = 1:numPatients
+    env_sig = all_envelopes{k};
+    raw_sig = double(data(k).ppg.v(:));
+    [b_bw, a_bw] = butter(2, 0.6/(fs/2), 'low');
+    bw_sig = filtfilt(b_bw, a_bw, raw_sig);
+    
+    imf_am = emd(env_sig, 'MaxNumIMF', 5);
+    imf_bw = emd(bw_sig, 'MaxNumIMF', 5);
+    
+    N_f = 2^15;
+    pxx_am_total = 0; pxx_bw_total = 0;
+    for i = 1:size(imf_am, 2)
+        [pxx, f_e] = periodogram(detrend(imf_am(:,i)), hann(length(imf_am(:,i))), N_f, fs);
+        pxx_am_total = pxx_am_total + (pxx / max(pxx + eps));
+    end
+    for i = 1:size(imf_bw, 2)
+        [pxx, ~] = periodogram(detrend(imf_bw(:,i)), hann(length(imf_bw(:,i))), N_f, fs);
+        pxx_bw_total = pxx_bw_total + (pxx / max(pxx + eps));
+    end
+    
+    idx_e = find(f_e >= resp_band(1) & f_e <= resp_band(2));
+    f_bpm_e = f_e(idx_e)*60;
+    mask_e = gaussmf(f_bpm_e, [4 17]);
+    p_final = (pxx_am_total(idx_e)/max(pxx_am_total(idx_e))) .* ...
+              (pxx_bw_total(idx_e)/max(pxx_bw_total(idx_e))) .* mask_e(:);
+    
+    [~, max_id] = max(p_final);
+    rr_emd_spectral(k) = f_bpm_e(max_id);
+end
+
+%% ================================================================
+% 4. STATISTICAL PARAMETERS & CLINICAL METRICS
+%% ================================================================
+ref_rr = results(:, 2);
+est_rr = rr_emd_spectral;
+error_val = est_rr - ref_rr;
+abs_error = abs(error_val);
+
+% Metrics
+mae_val = mean(abs_error);
+rmse_val = sqrt(mean(error_val.^2));
+corr_val = corr(ref_rr, est_rr);
+bias_val = mean(error_val);
+sd_val = std(error_val);
+
+%% ================================================================
+% 5. DETAILED PLOTS (ANALYSIS + CLINICAL VALIDATION)
+%% ================================================================
+% VISUALIZATION: HYBRID EMD-SPECTRAL ANALYSIS
+% ================================================================
+p_id = 51; 
+
+% 1.data preparation
+env_v = all_envelopes{p_id};
+raw_v = double(data(p_id).ppg.v(:));
+[b_v, a_v] = butter(2, 0.6/(fs/2), 'low');
+bw_v = filtfilt(b_v, a_v, raw_v);
+
+% 2. EMD decomposition
+imf_am_v = emd(env_v, 'MaxNumIMF', 5);
+imf_bw_v = emd(bw_v, 'MaxNumIMF', 5);
+
+% 3.spectrum calculation
+f_vec = linspace(resp_band(1), resp_band(2), 500);
+f_bpm_v = f_vec * 60;
+pxx_am_sum = zeros(size(f_vec));
+
+figure('Name', ['Task 4 Hybrid Analysis: Patient ' num2str(p_id)], 'Position', [100 50 1000 750]);
+
+% --- Subplot 1: AM IMFs in Time Domain ---
+subplot(3,2,1);
+plot(env_v, 'k', 'LineWidth', 1); hold on;
+plot(imf_am_v(:,3), 'r'); 
+title('AM Envelope & IMF 3 (Time Domain)');
+legend('Original', 'IMF 3'); grid on;
+
+% --- Subplot 2: Individual IMF Spectra (AM) ---
+subplot(3,2,2);
+hold on;
+for i = 1:size(imf_am_v, 2)
+    [p_temp, f_temp] = periodogram(imf_am_v(:,i), rectwin(length(imf_am_v(:,i))), 2^14, fs);
+    p_interp = interp1(f_temp*60, p_temp/max(p_temp), f_bpm_v);
+    plot(f_bpm_v, p_interp, 'DisplayName', ['IMF ' num2str(i)]);
+    pxx_am_sum = pxx_am_sum + p_interp;
+end
+title('Normalized Spectra of all AM IMFs');
+xlabel('BPM'); ylabel('Rel. Power'); legend show; grid on;
+
+% --- Subplot 3: Summed Spectra (AM vs BW) ---
+subplot(3,2,3);
+pxx_bw_sum = zeros(size(f_vec));
+for i = 1:size(imf_bw_v, 2)
+    [p_temp, f_temp] = periodogram(imf_bw_v(:,i), rectwin(length(imf_bw_v(:,i))), 2^14, fs);
+    p_interp = interp1(f_temp*60, p_temp/max(p_temp), f_bpm_v);
+    pxx_bw_sum = pxx_bw_sum + p_interp;
+end
+plot(f_bpm_v, pxx_am_sum/max(pxx_am_sum), 'b', 'LineWidth', 1.5); hold on;
+plot(f_bpm_v, pxx_bw_sum/max(pxx_bw_sum), 'g', 'LineWidth', 1.5);
+title('Summed Spectra: Path A (AM) vs Path B (BW)');
+legend('Summed AM', 'Summed BW'); grid on;
+
+% --- Subplot 4: The Gaussian Mask ---
+subplot(3,2,4);
+mask_v = gaussmf(f_bpm_v, [4 17]);
+fill(f_bpm_v, mask_v, 'y', 'FaceAlpha', 0.2); hold on;
+plot(f_bpm_v, mask_v, 'k--', 'LineWidth', 1.5);
+title('Physiological Weighting Mask (17 BPM Center)');
+xlabel('BPM'); grid on;
+
+% --- Subplot 5: FINAL HYBRID PRODUCT ---
+subplot(3,2,5:6);
+final_psd = (pxx_am_sum/max(pxx_am_sum)) .* (pxx_bw_sum/max(pxx_bw_sum)) .* mask_v;
+plot(f_bpm_v, final_psd, 'r', 'LineWidth', 2);
+[~, max_idx] = max(final_psd);
+hold on;
+plot(f_bpm_v(max_idx), final_psd(max_idx), 'ko', 'MarkerSize', 10, 'LineWidth', 2);
+text(f_bpm_v(max_idx)+0.5, final_psd(max_idx), ['Estimated: ' num2str(f_bpm_v(max_idx), '%.2f') ' BPM'], 'FontSize', 12, 'FontWeight', 'bold');
+title(['Final Hybrid EMD-Spectral Product (Patient ' num2str(p_id) ')']);
+xlabel('Breaths Per Minute (BPM)'); grid on;
+
+
+% --- B. CLINICAL VALIDATION: BLAND-ALTMAN & CORRELATION ---
+figure('Name', 'Clinical Agreement Analysis', 'Position', [100 100 1100 450]);
+% Correlation
+subplot(1,2,1);
+scatter(ref_rr, est_rr, 50, 'filled', 'MarkerFaceAlpha', 0.5); hold on;
+plot([minRR_bpm maxRR_bpm], [minRR_bpm maxRR_bpm], 'r--', 'LineWidth', 2);
+xlabel('Reference RR (BPM)'); ylabel('Estimated RR (BPM)');
+title(['Correlation: r = ' num2str(corr_val, '%.2f')]); grid on; axis square;
+
+% Bland-Altman
+subplot(1,2,2);
+avg_val = (ref_rr + est_rr) / 2;
+scatter(avg_val, error_val, 50, 'MarkerEdgeColor', [0.3 0.3 0.3], 'MarkerFaceColor', [0.4 0.6 0.9]); hold on;
+line([min(avg_val) max(avg_val)], [bias_val bias_val], 'Color', 'k', 'LineWidth', 2);
+line([min(avg_val) max(avg_val)], [bias_val + 1.96*sd_val bias_val + 1.96*sd_val], 'Color', 'r', 'LineStyle', '--');
+line([min(avg_val) max(avg_val)], [bias_val - 1.96*sd_val bias_val - 1.96*sd_val], 'Color', 'r', 'LineStyle', '--');
+xlabel('Mean RR (BPM)'); ylabel('Error (BPM)');
+title('Bland-Altman: Limits of Agreement'); grid on;
+
+% --- C. ERROR DISTRIBUTION ---
+figure('Name', 'Error Histogram');
+histogram(error_val, 'BinWidth', 0.5, 'FaceColor', [0.2 0.7 0.5]);
+xlabel('Error (BPM)'); ylabel('Frequency'); title('Distribution of Residuals'); grid on;
+
+%% ================================================================
+% 6. OUTPUT SUMMARY TABLES
+%% ================================================================
+% BW Dominant Freq Table (Task 3)
+BW_Table = table((1:numPatients)', ref_rr, dom_freq_list(:,2), abs(dom_freq_list(:,2)-ref_rr), ...
+    'VariableNames', {'Patient', 'Ref_RR', 'BW_BPM', 'Error'});
+disp('--- Task 3: Baseline Wander Dominant Frequencies ---');
+disp(BW_Table(1:min(53, numPatients), :));
+
+% Final Hybrid Results Table
+Final_Table = table((1:numPatients)', ref_rr, est_rr, abs_error, ...
+    'VariableNames', {'PatientID', 'Reference_BPM', 'Hybrid_EMD_BPM', 'Abs_Error'});
+fprintf('\n--- FINAL RR ESTIMATION RESULTS  ---\n');
+disp(Final_Table(1:min(53, numPatients), :));
+
+% Performance Summary
+fprintf('\n================ PERFORMANCE SUMMARY ================\n');
+fprintf('Mean Absolute Error (MAE):    %.2f BPM\n', mae_val);
+fprintf('Root Mean Square Error:       %.2f BPM\n', rmse_val);
+fprintf('Mean Bias:                    %.2f BPM\n', bias_val);
+fprintf('Correlation Coefficient (r):  %.2f\n', corr_val);
+fprintf('Accuracy (<1 BPM Error):      %.1f%%\n', (sum(abs_error < 1)/numPatients)*100);
+fprintf('Accuracy (<2 BPM Error):      %.1f%%\n', (sum(abs_error < 2)/numPatients)*100);
+fprintf('=====================================================\n');
